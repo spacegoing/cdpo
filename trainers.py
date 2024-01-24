@@ -94,6 +94,42 @@ def preference_loss(
   return losses, chosen_rewards, rejected_rewards
 
 
+def pl_dpo_loss(
+    pi_logps: torch.FloatTensor,
+    ref_logps: torch.FloatTensor,
+    rank_mat: torch.FloatTensor,
+    beta: float,
+) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
+  """Compute the DPO loss for Plackett-Luce model
+     N is the number of sets of answers, K is the number of answers per set.
+
+    Args:
+        ref/policy_logps: (N,K) for K choices;
+
+    Returns:
+    """
+  N, K = pi_logps.shape
+  loss = 0
+
+  for i in range(N):
+    for k in range(K):
+      rank_k = rank_mat[i, k]  # Current choice in the ranking
+      remaining_choices = rank_mat[i, k:]  # Remaining choices
+
+      # Calculate the numerator: exp(beta * (pi_logp - ref_logp)) for the current choice
+      numerator = torch.exp(beta *
+                            (pi_logps[i, rank_k] - ref_logps[i, rank_k]))
+
+      # Calculate the denominator: sum of exp(beta * (pi_logp - ref_logp)) over remaining choices
+      denominator = torch.sum(
+          torch.exp(beta * (pi_logps[i, remaining_choices] -
+                            ref_logps[i, remaining_choices])))
+
+      loss -= torch.log(numerator / denominator)
+
+  return loss / N
+
+
 def _get_batch_logps(logits: torch.FloatTensor,
                      labels: torch.LongTensor,
                      average_log_prob: bool = False) -> torch.FloatTensor:
@@ -123,6 +159,42 @@ def _get_batch_logps(logits: torch.FloatTensor,
     return (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1)
   else:
     return (per_token_logps * loss_mask).sum(-1)
+
+
+def calculate_log_probs(models, answers, tokenizer):
+  """
+    Calculate log probabilities for a list of answers using two models.
+
+    Args:
+        models (tuple): A tuple of two models (m_ref, m_p).
+        answers (list): A list of ranked answers of shape [N, K, T].
+        tokenizer: Tokenizer compatible with the models.
+
+    Returns:
+        Tuple[torch.FloatTensor, torch.FloatTensor]: Tensors of log probabilities from m_ref and m_p.
+    """
+  m_ref, m_p = models
+  N, K, _ = answers.shape
+  pi_logps = torch.zeros((N, K))
+  ref_logps = torch.zeros((N, K))
+
+  for i in range(N):
+    for j in range(K):
+      answer_tokens = answers[i, j]
+
+      # Tokenize the answer
+      input_ids = tokenizer.encode(answer_tokens, return_tensors='pt')
+
+      # Calculate log probabilities for each model
+      with torch.no_grad():
+        outputs_ref = m_ref(input_ids)
+        outputs_pi = m_p(input_ids)
+
+      # Assume the output is the log probability of the last token
+      ref_logps[i, j] = outputs_ref.logits[0, -1].log_softmax(dim=-1).max()
+      pi_logps[i, j] = outputs_pi.logits[0, -1].log_softmax(dim=-1).max()
+
+  return ref_logps, pi_logps
 
 
 def concatenated_inputs(
